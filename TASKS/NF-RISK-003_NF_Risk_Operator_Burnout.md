@@ -1,278 +1,151 @@
-# [Feature] NF-RISK-003: 단일 제작자 burnout 위험 — 운영 부담 모니터링 + 자동 알림 + 비상 SOP
+# [NF] NF-RISK-003: R6 접근성 미충족 — Stage 0 Exit 100% 게이트 부재 시 Alpha 차단
 
 ```yaml
 ---
 name: Feature Task
 about: SRS 기반의 구체적인 개발 태스크 명세
-title: "[Feature] NF-RISK-003: 단일 제작자 burnout 위험 대응 — 주간 운영 시간 추적 + 임계 알림 + 콘텐츠 발행 일시중단 SOP"
-labels: 'nf, risk, burnout, sop, priority:high, mvp-in, public-pilot'
+title: "[NF] NF-RISK-003: R6 접근성 미충족 리스크 — Stage 0 Exit 접근성 100% 게이트 (NF-A11Y-001 재사용 + 부재 시 Alpha Exit 차단)"
+labels: 'nf, risk, accessibility, gate, priority:high, mvp-in, alpha'
 assignees: ''
 ---
 ```
 
 ## :dart: Summary
-- **기능명**: [NF-RISK-003] CON-08 (단일 제작자) 의 핵심 위험 — burnout 대응. 주간 운영 시간 (콘텐츠 제작·이슈 대응·운영자 SOP 수행) 추적 + 임계 (주 50시간) 도달 시 자동 알림 + 콘텐츠 발행 일시중단 SOP + 사용자 공지 템플릿
-- **목적**: 본 사이트의 가장 큰 단일 실패 지점은 제작자 자신. 외부 의존성 (R7) 보다 운영자 burnout 이 더 큰 risk. 정량 측정 + 자동 알림 + 명확한 SOP 로 휴식 결정을 자동화 — 직관 또는 휴리스틱이 아닌 데이터 기반.
+- **기능명**: [NF-RISK-003] R6 접근성 미충족 리스크 완화 — Alpha Exit 강제 차단
+- **목적**: §6.6 R6 (접근성 체크리스트 미달 시 사용자 이탈 리스크) 를 **운영 정책** 수준에서 완화. NF-A11Y-001 이 기술적 게이트(axe·Lighthouse·NVDA)를 제공하지만, R6은 **해당 게이트가 실행되지 않는 상황 자체를 방지**하는 운영 정책. 게이트 누락·우회·지연을 감지하고 Alpha Exit 를 차단하는 안전장치.
+
+> **NF-A11Y-001 과의 차이점**: NF-A11Y-001 = 접근성 "기술 게이트" (axe + Lighthouse + NVDA 검증). NF-RISK-003 = 해당 게이트가 **실행·강제되는지** 감시하는 "운영 정책 + 에스컬레이션".
 
 ## :link: References (Spec & Context)
 > :bulb: AI Agent & Dev Note: 작업 시작 전 아래 문서를 반드시 먼저 Read/Evaluate 할 것.
-- SRS 문서:
-  - `/docs/SRS_V0_9.md#1.5.2` — CON-08 (단일 제작자)
-  - `/docs/SRS_V0_9.md#6.6` — Risk Register
-- 페르소나: 본 사이트 제작자 (Ella) 자신
-- 선행: CT-DB-009 (EventLog), FR-AUTH-002 (RBAC ADMIN)
-- 짝: NF-RISK-005 (Rollback), IF-CRON-004 (DR — 운영 부담 사촌)
+- SRS: `/docs/SRS_V0_9.md#6.6` — R6 (접근성 미충족)
+- SRS: `/docs/SRS_V0_9.md#1.2.5` — Stage 0 Exit Criteria
+- 선행: NF-A11Y-001 (접근성 기술 게이트)
+- 관련: IF-CI-002 (axe + Lighthouse CI Job)
 
 ## :white_check_mark: Task Breakdown (실행 계획)
-- [ ] **운영 시간 추적 정책 — admin Server Action 으로 기록**:
-  - 운영자가 매일 운영 시간 입력 (자가 보고)
-  - 또는 GitHub commit 시간 + Notion·Linear API 의 작업 시간 자동 추정
-  - 본 태스크는 **자가 보고 우선** (가장 정확) — admin 페이지에서 매일 입력
-- [ ] **OperatorActivityLog 모델 — 신규**:
-  ```prisma
-  model OperatorActivityLog {
-    id           String   @id @default(uuid())
-    userId       String   // ADMIN 본인
-    user         User     @relation(fields: [userId], references: [id])
-    date         DateTime @db.Date
-    hoursWorked  Float    // 0~24
-    category     String   // 'content' | 'ops' | 'support' | 'feature' | 'bugfix'
-    notes        String?  @db.Text
-    createdAt    DateTime @default(now())
-
-    @@unique([userId, date, category])
-    @@index([date])
-  }
-  ```
-- [ ] **자가 보고 admin Server Action**:
-  ```ts
-  'use server';
-  // app/admin/burnout/actions.ts
-  export async function logOperatorActivity(input: {
-    date: string;  // YYYY-MM-DD
-    hours_worked: number;
-    category: 'content' | 'ops' | 'support' | 'feature' | 'bugfix';
-    notes?: string;
-  }) {
-    const user = await getCurrentUser();
-    if (user?.role !== 'ADMIN') throw new Error('FORBIDDEN');
-
-    if (input.hours_worked < 0 || input.hours_worked > 24) {
-      throw new Error('INVALID_HOURS');
-    }
-
-    await prisma.operatorActivityLog.upsert({
-      where: { userId_date_category: { userId: user.id, date: new Date(input.date), category: input.category } },
-      create: { userId: user.id, date: new Date(input.date), ...input },
-      update: { hoursWorked: input.hours_worked, notes: input.notes },
-    });
-  }
-  ```
-- [ ] **주간 집계 + 임계 검사 — `/api/admin/burnout-status` Route Handler**:
-  ```ts
-  export async function GET(req: Request) {
-    if (await requireRole('ADMIN', req) === false) {
-      return new Response('Forbidden', { status: 403 });
-    }
-
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const recent = await prisma.operatorActivityLog.findMany({
-      where: { date: { gte: sevenDaysAgo } },
-      orderBy: { date: 'asc' },
-    });
-
-    const totalHours = recent.reduce((sum, log) => sum + log.hoursWorked, 0);
-    const dailyAvg = totalHours / 7;
-    const byCategory = recent.reduce((acc, log) => {
-      acc[log.category] = (acc[log.category] || 0) + log.hoursWorked;
-      return acc;
-    }, {} as Record<string, number>);
-
-    const threshold_warning = totalHours >= 50;   // 주 50시간 — 경고
-    const threshold_critical = totalHours >= 60;  // 주 60시간 — critical (즉시 휴식 권장)
-
-    return NextResponse.json({
-      ok: true,
-      week_total_hours: totalHours,
-      daily_avg: dailyAvg,
-      by_category: byCategory,
-      threshold_warning,
-      threshold_critical,
-      recommendation: getRecommendation(totalHours),
-    });
-  }
-
-  function getRecommendation(hours: number): string {
-    if (hours >= 60) return '🚨 critical — 즉시 콘텐츠 발행 일시중단. 1주 휴식 권장.';
-    if (hours >= 50) return '⚠️ 경고 — 다음 주 운영 부담 줄이기. 비필수 작업 연기.';
-    if (hours >= 40) return '정상 범위. 균형 유지.';
-    return '여유 — 콘텐츠 작업 추가 가능.';
-  }
-  ```
-- [ ] **자동 알림 cron — 매주 일요일 09:00 KST**:
-  ```ts
-  // app/api/cron/burnout-check/route.ts
-  export async function POST(req: Request) {
-    if (!verifyCronAuth(req)) return new Response('Unauthorized', { status: 401 });
-
-    const result = await getBurnoutStatus();
-
-    if (result.threshold_critical) {
-      await resend.emails.send({
-        from: 'no-reply@economic-judgment.app',
-        to: process.env.OPERATOR_EMAIL!,
-        subject: '🚨 [Burnout Critical] 주 60시간 도달 — 즉시 휴식 권장',
-        html: render(BurnoutCriticalEmail({ hours: result.week_total_hours, byCategory: result.by_category })),
-      });
-
-      // EventLog
-      await prisma.eventLog.create({
-        data: { event: 'burnout.critical', payload: result },
-      });
-    } else if (result.threshold_warning) {
-      // 경고 이메일 (덜 강한 톤)
-      await resend.emails.send({
-        from: 'no-reply@economic-judgment.app',
-        to: process.env.OPERATOR_EMAIL!,
-        subject: '⚠️ [Burnout 경고] 주 50시간 — 다음 주 부담 조절',
-        html: render(BurnoutWarningEmail({ hours: result.week_total_hours })),
-      });
-    }
-
-    return NextResponse.json(result);
-  }
-  ```
-- [ ] **콘텐츠 발행 일시중단 SOP — `docs/burnout-content-pause-sop.md`**:
+- [ ] **Alpha Exit Checklist 공식화** — `docs/ops/alpha-exit-checklist.md`:
   ```markdown
-  # Burnout 콘텐츠 발행 일시중단 SOP
-
-  ## 트리거
-  - 주 60시간 초과 (자동 알림)
-  - 또는 운영자 주관 판단 (피로 누적·집중력 저하·수면 부족)
-
-  ## 절차 (1주 일시중단 기준)
-  1. **공지 작성** — 본 SOP 의 템플릿 활용
-  2. **랜딩 배너 노출** — `/api/admin/banner` 에 ANNOUNCE 등록
-  3. **신규 lesson 발행 0** — 1주
-  4. **사용자 문의 응답 only** — 24시간 내 (긴급만)
-  5. **CI 자동 게이트 유지** — IF-CI-001~006 정상 운영
-  6. **DR drill 일정 연기** — 1주
-
-  ## 사용자 공지 템플릿
-  ```html
-  <p>안녕하세요, 경제 판단력 교과서 제작자입니다.</p>
-  <p>이번 주는 운영자의 휴식을 위해 신규 lesson 발행을 일시중단합니다.</p>
-  <p>기존 콘텐츠는 정상 이용 가능하며, 다음 주부터 정상 운영됩니다.</p>
-  <p>감사합니다.</p>
+  ## Alpha Exit Criteria — 접근성 항목 (R6 강제)
+  
+  | # | 항목 | 검증 방법 | 통과 기준 | 담당 |
+  |---|---|---|---|---|
+  | 1 | axe-core 위반 0건 | IF-CI-002 자동 | violations === 0 | CI |
+  | 2 | Lighthouse a11y ≥ 95 | IF-CI-002 자동 | score ≥ 95 | CI |
+  | 3 | 연속 7일 빌드 통과 | FR-KPI-008 추적 | consecutive ≥ 7 | 자동 |
+  | 4 | NVDA 수동 QA 완료 | TS-A11Y-002 수동 | EventLog 존재 | 운영자 |
+  | 5 | gate_achieved === true | NF-A11Y-001 함수 | true | 자동 |
+  | 6 | 키보드 100% 탐색 | TS-E2E-005 자동 | PASS | CI |
+  | 7 | 자막 기본 ON | NF-A11Y-002 확인 | cc_load_policy=1 | 코드 |
+  
+  **규칙**: 7개 항목 중 **1건이라도 미충족 시 Alpha Exit 차단**
   ```
+- [ ] **게이트 누락 감지 Cron** — `app/api/cron/risk-r6-check/route.ts`:
+  ```ts
+  import { verifyStage0ExitA11y } from '@/lib/stage-gates/stage0-exit';
 
-  ## 재개 절차
-  - 1주 후 운영자 자가 진단 (정상 컨디션 확인)
-  - 점진 재개 — 첫 주는 50% 부담만
-  - admin 대시보드의 burnout-status 정상 범위 도달 시 정상 운영
+  export async function GET() {
+    const result = await verifyStage0ExitA11y();
+    
+    // 게이트 실행 자체가 안 된 경우 감지
+    const lastAxeRun = await prisma.eventLog.findFirst({
+      where: { eventName: 'ci.axe_completed' },
+      orderBy: { timestamp: 'desc' },
+    });
+    
+    const daysSinceLastAxe = lastAxeRun 
+      ? (Date.now() - lastAxeRun.timestamp.getTime()) / 86400_000
+      : Infinity;
+    
+    if (daysSinceLastAxe > 3) {
+      await sendSev2Alert('⚠️ R6: axe CI가 3일 이상 미실행. 접근성 게이트 누락 위험', {
+        lastRun: lastAxeRun?.timestamp,
+        daysSince: Math.floor(daysSinceLastAxe),
+      });
+    }
+    
+    if (!result.gate_achieved) {
+      await sendSev3Alert('R6: 접근성 게이트 미충족 상태', {
+        criteria: result.criteria.filter(c => !c.passed),
+      });
+    }
+    
+    return Response.json({ result, daysSinceLastAxe });
+  }
   ```
-- [ ] **admin 대시보드 — `/admin/burnout`**:
-  - 최근 4주 시간 시계열 차트
-  - 카테고리별 분포 (content / ops / support / feature / bugfix)
-  - 임계 알림 + recommendation
-  - 자가 보고 입력 폼
-- [ ] **외부 응원 정책 (선택, 별도 후속)**:
-  - 사용자 후원 페이지 (Toss 후원 등)
-  - 자원봉사자 모집 (콘텐츠 검토 외주)
-  - 본 태스크는 SOP 까지만. 후원·모집은 Stage 2 검토
-- [ ] **PII 보호**: hoursWorked + category 만. 본인 외 노출 0
-- [ ] **응답 시간**: ≤ 200ms
+- [ ] **에스컬레이션 정책**:
+  | 상태 | 기간 | 조치 |
+  |---|---|---|
+  | axe CI 미실행 | 3일 | Sev2 알림 |
+  | 게이트 미충족 | 지속 | Sev3 일간 알림 |
+  | Alpha Exit 시도 + 게이트 실패 | 즉시 | Sev1 — Exit 차단 |
+- [ ] **"접근성 후순위" 방지 가드레일**:
+  - PR 라벨에 `a11y-exempt` 금지 (CI 검증 skip 불가)
+  - `outline: none` 전역 추가 시 린터 경고
+  - 접근성 관련 이슈 "wontfix" 라벨 금지
 
 ## :test_tube: Acceptance Criteria (BDD/GWT)
 
-### Scenario 1: 자가 보고 정상
-- **Given**: ADMIN
-- **When**: logOperatorActivity({ date: '2026-04-26', hours_worked: 8, category: 'content' })
-- **Then**: OperatorActivityLog INSERT
+### Scenario 1: 전체 게이트 충족 — Alpha Exit 가능
+- **Given**: 7개 접근성 항목 전체 PASS
+- **When**: Alpha Exit 시도
+- **Then**: Exit 허용
 
-### Scenario 2: 24시간 초과 — 거부
-- **Given**: hours_worked: 25
+### Scenario 2: 1건 미충족 — Alpha Exit 차단
+- **Given**: Lighthouse 94점 (미달)
+- **When**: Alpha Exit 시도
+- **Then**: Exit 차단 + Sev1 알림
+
+### Scenario 3: axe CI 3일 미실행 — Sev2
+- **Given**: 마지막 axe 실행 4일 전
+- **When**: R6 Cron 실행
+- **Then**: Sev2 알림 "게이트 누락 위험"
+
+### Scenario 4: NF-A11Y-001 gate_achieved 연동
+- **Given**: NF-A11Y-001 verifyStage0ExitA11y()
 - **When**: 호출
-- **Then**: throw INVALID_HOURS
+- **Then**: NF-RISK-003 에서 결과 참조
 
-### Scenario 3: 음수 시간 — 거부
-- **Given**: hours_worked: -1
-- **When**: 호출
-- **Then**: throw
+### Scenario 5: a11y-exempt 라벨 방지
+- **Given**: PR에 `a11y-exempt` 라벨
+- **When**: CI 실행
+- **Then**: 경고 + axe 검증은 skip 불가
 
-### Scenario 4: 동일 (date, category) 재보고 — UPSERT
-- **Given**: 동일 키 존재
-- **When**: 재호출 with 다른 hours
-- **Then**: hoursWorked 갱신
-
-### Scenario 5: 주 50시간 — 경고 알림
-- **Given**: 주 누적 50시간
-- **When**: 일요일 cron
-- **Then**: warning 이메일 + EventLog (없음 — warning 만)
-
-### Scenario 6: 주 60시간 — critical
-- **Given**: 누적 60
-- **When**: cron
-- **Then**: critical 이메일 + EventLog `burnout.critical`
-
-### Scenario 7: 주 35시간 — 알림 없음
-- **Given**: 정상 범위
-- **When**: cron
-- **Then**: 메일 0
-
-### Scenario 8: GET /api/admin/burnout-status — 응답
-- **Given**: 데이터
-- **When**: ADMIN GET
-- **Then**: 200 + 모든 필드
-
-### Scenario 9: non-ADMIN — 403
-- **Given**: LEARNER
-- **When**: 호출
-- **Then**: 403
-
-### Scenario 10: SOP 문서 + 대시보드 작성
-- **Given**: 본 태스크 PR
+### Scenario 6: 에스컬레이션 정책 문서
+- **Given**: `docs/ops/alpha-exit-checklist.md`
 - **When**: 검토
-- **Then**: docs/burnout-content-pause-sop.md + /admin/burnout 페이지 모두 존재
+- **Then**: 7개 항목 + 에스컬레이션 3단계
+
+### Scenario 7: NVDA 검증 90일 초과 — 차단
+- **Given**: NVDA 수동 QA 91일 전
+- **When**: 게이트 검증
+- **Then**: nvda-manual-90d FAIL
+
+### Scenario 8: 게이트 우회 불가
+- **Given**: ADMIN 역할
+- **When**: 게이트 override 시도
+- **Then**: 불가 (코드에 override 경로 없음)
 
 ## :gear: Technical & Non-Functional Constraints
-- **자가 보고 우선**: 자동 추정보다 정확
-- **임계 — 50 (warning) / 60 (critical)**: 환경변수화 가능
-- **카테고리 5종**: content / ops / support / feature / bugfix
-- **UPSERT 정책**: 동일 (date, category) 재보고 허용 (편집)
-- **cron 매주 일요일 09:00 KST (UTC 일 00:00)**
-- **PII 보호**: 본인 외 노출 0 (관리자도 본인만)
-- **SOP 명확성**: 일시중단·재개 모두 정량 기준
-- **응답 시간 ≤ 200ms**
+- **NF-A11Y-001 재사용**: 기술 게이트는 NF-A11Y-001. 본 태스크는 운영 정책
+- **AND 강제**: 7개 항목 모두 충족 (OR 허용 불가)
+- **Cron 주기**: 일 1회 R6 체크
+- **Alpha 이후에도 유효**: Stage 0 Exit 후에도 분기 1회 NVDA 재검증
 - **금지**:
-  - 24시간 초과 또는 음수 허용
-  - 자동 추정만 활용 (자가 진단 우선)
-  - critical 알림 silent fail
-  - 다른 사용자의 시간 노출
+  - 게이트 우회 (admin override)
+  - axe CI skip
+  - 접근성 이슈 "wontfix"
+  - `a11y-exempt` 라벨
 
 ## :checkered_flag: Definition of Done (DoD)
-- [ ] 10개 GWT 시나리오 전부 통과
-- [ ] OperatorActivityLog 모델
-- [ ] logOperatorActivity() Server Action
-- [ ] /api/admin/burnout-status Route Handler
-- [ ] /api/cron/burnout-check Route Handler
-- [ ] /admin/burnout 페이지
-- [ ] burnout-content-pause-sop.md 문서
-- [ ] 메일 템플릿 (warning + critical)
-- [ ] EventLog `burnout.critical` 발행
-- [ ] PR 본문에 "CON-08 단일 제작자 burnout 자동 모니터링" 명시
-- [ ] Linter 경고 0건
+- [ ] 8개 GWT 시나리오 통과
+- [ ] Alpha Exit Checklist 문서 (7개 항목)
+- [ ] R6 감지 Cron 구현
+- [ ] 에스컬레이션 3단계 정책
+- [ ] 가드레일 린터 규칙
+- [ ] PR 본문에 "R6 접근성 리스크. NF-A11Y-001 운영 정책" 명시
 
 ## :construction: Dependencies & Blockers
-- **Depends on**:
-  - CT-DB-002 (User)
-  - CT-DB-009 (EventLog)
-  - FR-AUTH-002 (RBAC)
-  - IF-RES-001 (Resend)
-  - CT-API-010 (Cron 패턴)
-- **Blocks**:
-  - CON-08 운영 안정성
-  - 장기 운영 지속 가능성
-- **Related**:
-  - NF-RISK-005 (Rollback — 운영 부담 사촌)
-  - IF-CRON-004 (DR — 분기 drill)
+- **Depends on**: NF-A11Y-001 (기술 게이트), IF-CI-002 (axe CI)
+- **Blocks**: Alpha Exit (접근성 미달 시 차단)
+- **Related**: §6.6 R6, CON-06, TS-A11Y-002, TS-E2E-005

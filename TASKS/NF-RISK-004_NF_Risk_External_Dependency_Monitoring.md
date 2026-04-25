@@ -1,232 +1,108 @@
-# [Feature] NF-RISK-004: 외부 의존성 (R7) — 5개 SaaS 상태 모니터링 + 차단 시 graceful + 마이그레이션 SOP
+# [NF] NF-RISK-004: R7 재정 지속성 — 후원 채널 + 자체 자본 2~3년 트랙 운영 계획
 
 ```yaml
 ---
 name: Feature Task
 about: SRS 기반의 구체적인 개발 태스크 명세
-title: "[Feature] NF-RISK-004: 외부 의존성 모니터링 — Vercel·Supabase·Resend·Gemini·YouTube 5개 SaaS 상태 추적 + graceful + Stage 2 마이그레이션 SOP"
-labels: 'nf, risk, dependency, monitoring, sop, priority:critical, mvp-in, public-pilot'
+title: "[NF] NF-RISK-004: R7 재정 지속성 — 운영 비용 2~3년 자본 트랙 구축 및 후원 시스템 통합"
+labels: 'nf, risk, finance, sustainability, priority:medium, mvp-defer, public-pilot'
 assignees: ''
 ---
 ```
 
 ## :dart: Summary
-- **기능명**: [NF-RISK-004] R7 (외부 의존성) 의 운영 모니터링 — Vercel + Supabase + Resend + Gemini + YouTube 5개 SaaS 의 상태 자동 추적 + 장애 시 graceful 동작 검증 + Stage 2 의 자체 호스팅 마이그레이션 SOP
-- **목적**: 본 사이트의 5개 외부 의존성 중 하나라도 장기 장애 시 운영 차단 위험. 정량 모니터링 + 장애 시 graceful (캐시 폴백·silent fail) + 위험 시점에 자체 호스팅 전환 가능한 SOP 보유 → R7 위험 mitigated.
+- **기능명**: [NF-RISK-004] R7 재정 지속성 리스크 완화 정책 및 시스템 구현
+- **목적**: §6.6 R7 완화. 본 서비스는 CC BY-NC-SA(비상업적) 모델을 채택하고 있어 앱 내 광고나 유료 구독으로 직접 수익을 창출할 수 없습니다. 따라서 초기 인프라 유지비용(최대 월 40만원 내외)을 커버할 수 있는 '자체 자본 트랙(2~3년 런웨이)' 설계 문서화와, 사용자 자발적인 '후원 채널(Buy Me a Coffee 등)'을 웹 서비스에 UI로 연동하여 재정 지속 가능성을 시스템 레벨에서 뒷받침합니다.
 
 ## :link: References (Spec & Context)
-> :bulb: AI Agent & Dev Note: 작업 시작 전 아래 문서를 반드시 먼저 Read/Evaluate 할 것.
-- SRS 문서:
-  - `/docs/SRS_V0_9.md#6.6` — R7 (외부 의존)
-  - `/docs/SRS_V0_9.md#3.1` — External Systems
-- 외부:
-  - https://www.vercel-status.com/
-  - https://status.supabase.com/
-  - https://status.resend.com/
-- 선행: CT-DB-009 (EventLog), IF-CRON-001 (warmup), IF-CACHE-001 (PDF 캐시), TS-IT-006 (PDF 5xx 카오스)
+- SRS: `/docs/SRS_V0_9.md#6.6` — R7 (재정 지속성)
+- 관련: NF-COST-001 (인프라 비용 모니터링), CON-07 (비용 한도)
 
 ## :white_check_mark: Task Breakdown (실행 계획)
-- [ ] **5개 외부 SaaS 정의 + 의존도**:
-  ```ts
-  export const EXTERNAL_DEPENDENCIES = [
-    { id: 'vercel', name: 'Vercel', criticality: 'critical', statusUrl: 'https://www.vercel-status.com/api/v2/status.json', migrationOption: 'Self-hosted Next.js on Railway/Fly' },
-    { id: 'supabase', name: 'Supabase', criticality: 'critical', statusUrl: 'https://status.supabase.com/api/v2/status.json', migrationOption: 'Self-hosted PostgreSQL + Auth (Lucia)' },
-    { id: 'resend', name: 'Resend', criticality: 'high', statusUrl: 'https://resend.statuspage.io/api/v2/status.json', migrationOption: 'AWS SES 또는 Mailgun' },
-    { id: 'gemini', name: 'Google Gemini', criticality: 'medium', statusUrl: 'https://status.cloud.google.com/incidents.json', migrationOption: 'Anthropic Claude API 또는 OpenAI' },
-    { id: 'youtube', name: 'YouTube (영상 호스팅)', criticality: 'critical', statusUrl: null, migrationOption: 'Cloudflare Stream 또는 Mux' },  // 공식 status API 없음
-  ];
-  ```
-- [ ] **상태 추적 cron — `/api/cron/dependency-status`** (매 30분):
-  ```ts
-  export async function POST(req: Request) {
-    if (!verifyCronAuth(req)) return new Response('Unauthorized', { status: 401 });
-
-    const results = [];
-    for (const dep of EXTERNAL_DEPENDENCIES) {
-      if (!dep.statusUrl) {
-        // YouTube 등 — 자체 ping (영상 페이지 fetch)
-        results.push(await checkYouTubeAvailability());
-        continue;
-      }
-      try {
-        const response = await fetch(dep.statusUrl, { signal: AbortSignal.timeout(5000) });
-        const data = await response.json();
-        const status = data.status?.indicator ?? 'none';  // 'none' | 'minor' | 'major' | 'critical'
-        results.push({ id: dep.id, status, checked_at: new Date().toISOString() });
-
-        if (status === 'major' || status === 'critical') {
-          await prisma.eventLog.create({
-            data: { event: 'dependency.degraded', payload: { id: dep.id, status, criticality: dep.criticality } },
-          });
-          // Sentry 즉시 알림 (criticality high 이상)
-          if (dep.criticality === 'critical' || dep.criticality === 'high') {
-            // Sentry.captureMessage(`${dep.name} 장애 — ${status}`, { level: 'error' });
-          }
-        }
-      } catch (e) {
-        results.push({ id: dep.id, status: 'unreachable', checked_at: new Date().toISOString() });
-      }
-    }
-
-    return NextResponse.json({ ok: true, results });
-  }
-  ```
-- [ ] **YouTube 자체 ping** — 단일 lesson 의 영상 메타 fetch:
-  ```ts
-  async function checkYouTubeAvailability(): Promise<{ id: string; status: string; checked_at: string }> {
-    try {
-      const sample = await prisma.lesson.findFirst({ select: { youtubeVideoId: true } });
-      if (!sample) return { id: 'youtube', status: 'unknown', checked_at: new Date().toISOString() };
-
-      const response = await fetch(`https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${sample.youtubeVideoId}&format=json`);
-      return {
-        id: 'youtube',
-        status: response.ok ? 'none' : 'major',
-        checked_at: new Date().toISOString(),
-      };
-    } catch (e) {
-      return { id: 'youtube', status: 'unreachable', checked_at: new Date().toISOString() };
-    }
-  }
-  ```
-- [ ] **graceful 동작 검증 (TS-IT-006 정합)**:
-  - **Vercel** — 본 사이트 자체 down 시 Vercel Edge 의 stale cache 폴백 (제한적)
-  - **Supabase** — pg-dump 백업 + DR Restore (IF-CRON-003·004)
-  - **Resend** — 메일 발송 silent fail (TS-IT-003 검증)
-  - **Gemini** — LLM 검증 nightly 위임 (IF-CI-006)
-  - **YouTube** — 글로 읽기 모드 (PRD 원칙 4 의 3매체) 자동 폴백
-  - 각 graceful 시나리오는 별도 통합 테스트 (이미 발행된 TS-IT-006 등)
-- [ ] **/api/admin/dependency-health** — 운영자 대시보드 응답:
-  ```ts
-  export async function GET(req: Request) {
-    if (await requireRole('ADMIN', req) === false) {
-      return new Response('Forbidden', { status: 403 });
-    }
-
-    const recent = await prisma.eventLog.findMany({
-      where: { event: 'dependency.degraded', createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
-      orderBy: { createdAt: 'desc' },
-    });
-
-    return NextResponse.json({
-      dependencies: EXTERNAL_DEPENDENCIES.map(dep => ({
-        ...dep,
-        recent_incidents_24h: recent.filter(e => (e.payload as any).id === dep.id).length,
-      })),
-      total_incidents_24h: recent.length,
-      summary: recent.length === 0 ? '✅ 24시간 내 장애 0' : `⚠️ ${recent.length}건 장애`,
-    });
-  }
-  ```
-- [ ] **/admin/dependencies 대시보드 페이지**:
-  - 5개 SaaS 카드 (criticality 표시) + 24시간 장애 카운트
-  - 마이그레이션 옵션 안내 (장애 누적 시 의사결정 보조)
-- [ ] **Stage 2 자체 호스팅 마이그레이션 SOP — `docs/dependency-migration-sop.md`**:
-  - 각 SaaS 별 마이그레이션 절차 (Vercel → Railway, Supabase → 자체 PostgreSQL 등)
-  - 트리거 조건 — 단일 SaaS 의 90일 누적 장애 ≥ 24시간 또는 비용 한도 초과
-  - 본 SOP 는 Stage 2 검토 항목 (Stage 1 에는 모니터링만)
-- [ ] **누적 장애 통계 — 90일 윈도**:
-  ```ts
-  // 90일 누적 장애 시간 계산
-  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
-  const incidents = await prisma.eventLog.findMany({
-    where: { event: 'dependency.degraded', createdAt: { gte: ninetyDaysAgo } },
-  });
-  // 각 SaaS 별 cumulative downtime
-  // 임계 — 24시간 초과 시 마이그레이션 검토 시그널
-  ```
-- [ ] **응답 시간**: cron 호출 ≤ 30초 (5 SaaS 병렬), 대시보드 ≤ 500ms
-- [ ] **PII 부재**: 외부 SaaS 메타만
+- [ ] **운영 재무 모델링 문서 작성 (`docs/ops/financial-sustainability.md`)**:
+  - 인프라 티어별 비용을 구체적으로 추계하여 마크다운 테이블 작성.
+  | 항목 | Vercel Hobby (현재) | Vercel Pro (미래 확장) |
+  |---|---|---|
+  | 컴퓨팅/호스팅 | ₩0 | $20/월 (약 2.7만) |
+  | Supabase DB | ₩0 | $25/월 (약 3.4만) |
+  | 오류 관제(Sentry) | ₩0 | $26/월 (약 3.5만) |
+  | 개발 도구 | ₩30,000 이하 | ₩300,000 이하 |
+  | 콘텐츠 외주 | ₩0 ~ 200,000 | ₩0 ~ 200,000 |
+  | **월 추정 한도** | **약 230,000원** | **약 596,000원** |
+  - 위 계산을 바탕으로, 초기 런웨이(Runway) 24개월에 필요한 "약 552만 원"의 예산 확보안과 소진 스케줄 기재.
+- [ ] **글로벌 후원 링크 배너/컴포넌트 개발**:
+  - `components/layout/SupportBanner.tsx` 컴포넌트 개발.
+  - "이 프로젝트는 무료 및 비영리로 운영됩니다. 서버 유지비를 후원해 주세요 ☕" 문구.
+  - 플랫폼 결제가 아닌, 토스 익명 송금 링크, Buy Me a Coffee 링크, 혹은 카카오페이 QR 등으로 연결.
+  - 페이지 하단(Footer) 및 스탬프 맵 달성 팝업(스탬프 10개 도달 시 넛지) 위치에 배치.
+- [ ] **분기 재정 리뷰 시스템(SOP) 수립**:
+  - 분기(3개월) 단위로 런웨이(남은 예산 / 월 소진율)를 계산하여 `docs/ops/quarterly-finance-YYYY-QN.md` 문서를 작성하는 프로세스 수립.
+- [ ] **비상 조치 시나리오(Emergency Plan) 명문화**:
+  - 런웨이가 6개월 미만으로 떨어질 경우의 조치(개발 도구 구독 해지, 신규 콘텐츠 외주 즉시 중단, Vercel/Supabase 최적화 다운그레이드) 정책.
 
 ## :test_tube: Acceptance Criteria (BDD/GWT)
 
-### Scenario 1: 5개 SaaS 정상 — cron 정상 응답
-- **Given**: 모든 SaaS 'none' status
-- **When**: cron 호출
-- **Then**: 200 + results 5건 모두 'none'
+### Scenario 1: 재정 모델링 문서 완전성 검증
+- **Given**: 레포지토리 저장소
+- **When**: `docs/ops/financial-sustainability.md` 열람
+- **Then**: Free 모드와 Pro 모드 시나리오에 대한 런웨이 기간 계산표가 작성되어 있어야 함
 
-### Scenario 2: Vercel 'major' — Sentry 알림 + EventLog
-- **Given**: Vercel API 'major' 응답
-- **When**: cron
-- **Then**: EventLog `dependency.degraded` 1건 + Sentry
+### Scenario 2: Footer 후원 컴포넌트 노출
+- **Given**: 일반 사용자 (Learner)로 로그인된 브라우저
+- **When**: 메인 페이지 하단으로 스크롤
+- **Then**: 명확한 후원 호소 문구와 함께 외부 후원 플랫폼(Buy Me a Coffee 등)으로 이어지는 링크 또는 버튼이 노출됨
 
-### Scenario 3: Supabase 'critical' — 즉시 critical 알림
-- **Given**: critical
-- **When**: cron
-- **Then**: Sentry critical level
+### Scenario 3: 긍정적 넛지(스탬프 도달 시점) 노출
+- **Given**: 사용자 스탬프 개수가 10개에 도달함
+- **When**: 10개 달성 축하 팝업/모달이 렌더링될 때
+- **Then**: 만족도가 가장 높은 순간에 맞추어, 후원 링크 컴포넌트가 과도하지 않은 텍스트 형태로 함께 렌더링됨
 
-### Scenario 4: 외부 API timeout — 'unreachable'
-- **Given**: 5초 timeout
-- **When**: 호출
-- **Then**: status: 'unreachable'
+### Scenario 4: 외부 후원 링크 전환 정상
+- **Given**: 후원 링크 클릭
+- **When**: 사용자가 버튼 상호작용
+- **Then**: 새 창(`target="_blank"`, `rel="noopener noreferrer"`)으로 안전하게 서드파티 후원 사이트가 열림
 
-### Scenario 5: YouTube 자체 ping — oembed
-- **Given**: 정상
-- **When**: 호출
-- **Then**: status: 'none'
+### Scenario 5: 비상업적 성격(CC BY-NC-SA) 위반 방지 체크
+- **Given**: 후원 페이지 기획
+- **When**: 후원자에 대한 리워드 설계 검토
+- **Then**: 후원금은 "콘텐츠 열람 권한 판매(Paywall)"나 "유료 기능 언락" 방식이 아님을 문서로 증명하여 라이선스 법적 충돌을 차단함
 
-### Scenario 6: graceful 검증 — Resend 5xx
-- **Given**: Resend 장애
-- **When**: 메일 발송 시도
-- **Then**: silent fail (TS-IT-003 정합)
+### Scenario 6: 분기 리뷰 가이드 문서화
+- **Given**: 인수인계 또는 운영 가이드 문서
+- **When**: 분기 재정 리뷰 프로세스 확인
+- **Then**: Vercel/Supabase 청구서 확인 -> 지출 계산 -> 런웨이 계산 -> 후원금 수입 차감 의 단계별 SOP가 명시됨
 
-### Scenario 7: 24시간 누적 장애 카운트
-- **Given**: 24h 내 장애 5건
-- **When**: GET /api/admin/dependency-health
-- **Then**: total_incidents_24h: 5
+### Scenario 7: 비상 조치 발동 조건 명시
+- **Given**: 분기 리뷰 결과 잔여 예산이 6개월치 미만임
+- **When**: 비상 조치(Emergency Plan) 프로토콜 참조
+- **Then**: 유료 SaaS 해지 순서(1순위: 코딩 도구 등 내부망, 2순위: 외주비)가 구체적으로 적시되어 있음
 
-### Scenario 8: 90일 누적 — 마이그레이션 시그널
-- **Given**: 90일 cumulative downtime > 24h
-- **When**: 검사
-- **Then**: 운영자 알림 + SOP 안내
+### Scenario 8: 광고 스크립트 배제 보장
+- **Given**: 재무 압박이 발생한 상황 가정
+- **When**: Google AdSense 등 광고 삽입 요청이 발생
+- **Then**: 문서화된 운영 정책에 의해, 광고 노출은 교육 콘텐츠의 집중도를 해치므로 원천 금지(`NF-SEC-003`의 CDN 차단 정책과 연계)함을 명시함
 
-### Scenario 9: non-ADMIN — 403
-- **Given**: LEARNER
-- **When**: dependency-health
-- **Then**: 403
+### Scenario 9: 컴포넌트 반응형 대응
+- **Given**: 후원 배너 컴포넌트
+- **When**: 모바일 기기(너비 360px)에서 렌더링
+- **Then**: 가로 스크롤이나 레이아웃 깨짐 없이 텍스트 크기와 버튼이 모바일 뷰에 맞게 축소 및 정렬됨
 
-### Scenario 10: 마이그레이션 SOP 문서
-- **Given**: docs/dependency-migration-sop.md
-- **When**: 검토
-- **Then**: 5 SaaS 절차 + 트리거 조건 명시
+### Scenario 10: 후원 링크 접근성 (a11y)
+- **Given**: 시각 장애인용 스크린 리더
+- **When**: 후원 링크 포커싱
+- **Then**: "외부 사이트로 이동하여 프로젝트를 후원합니다" 와 같은 구체적인 `aria-label`이 읽힘
 
 ## :gear: Technical & Non-Functional Constraints
-- **5개 SaaS — criticality 차등**: critical / high / medium
-- **30분 cron**: 너무 자주는 부담 + 너무 드물면 인지 지연
-- **Sentry 알림 — criticality high 이상만**: 노이즈 최소
-- **graceful 검증 — 통합 테스트 (TS-IT-006 등)**
-- **YouTube — 자체 ping (oembed)**: 공식 API 부재 보강
-- **Stage 2 마이그레이션 SOP — 트리거 조건 명시**: 90일 24시간 또는 비용 한도
-- **PII 부재**: 외부 SaaS 메타만
-- **응답 시간 — cron ≤ 30초, 대시보드 ≤ 500ms**
-- **금지**:
-  - 단일 SaaS 에 critical 의존성 (대안 없음 위험)
-  - 마이그레이션 SOP 없이 운영 시작
-  - 누적 장애 90일 초과 후에도 마이그레이션 미검토
+- **UI/UX 균형**: 후원 배너는 학습 경험을 절대 방해(팝업 형태의 인터럽트)하지 않고, 사용자가 원할 때만 클릭할 수 있는 수동적 형태(Footer) 또는 긍정적 모멘텀(축하 팝업 하단)에만 배치.
+- **법적 제약**: 개인 후원은 기부금 영수증 발급 대상이 아니므로, "기부"라는 단어 대신 "후원" 또는 "서버 유지비 지원" 워딩 사용 필수.
 
 ## :checkered_flag: Definition of Done (DoD)
-- [ ] 10개 GWT 시나리오 전부 통과
-- [ ] EXTERNAL_DEPENDENCIES 5개 정의
-- [ ] dependency-status cron Route Handler
-- [ ] YouTube 자체 ping
-- [ ] /api/admin/dependency-health Route Handler
-- [ ] /admin/dependencies 대시보드
-- [ ] dependency-migration-sop.md 문서
-- [ ] EventLog `dependency.degraded` 발행
-- [ ] 응답 시간 측정
-- [ ] PR 본문에 "R7 외부 의존성 모니터링 + Stage 2 마이그레이션 SOP" 명시
-- [ ] Linter 경고 0건
+- [ ] 10개 GWT 시나리오 통과 및 기획 리뷰 완료
+- [ ] 재정 정책 및 런웨이 계산 MD 문서 커밋 완료
+- [ ] `<SupportBanner />` React 컴포넌트 구현 및 Footer 통합
+- [ ] 스크린 리더용 aria 텍스트 작성 완료
+- [ ] PR 본문에 "R7 재정 지속성 확보 및 후원 UI 추가" 명시
 
 ## :construction: Dependencies & Blockers
-- **Depends on**:
-  - CT-DB-009 (EventLog)
-  - FR-AUTH-002 (RBAC)
-  - IF-RES-001 (Resend)
-  - CT-API-010 (Cron 패턴)
-  - TS-IT-006 (PDF 5xx 카오스)
-- **Blocks**:
-  - R7 위험 mitigation
-  - Stage 2 마이그레이션 의사결정
-- **Related**:
-  - IF-CACHE-001 (PDF 캐시 폴백)
-  - NF-COST-001~002 (비용 모니터링, 그룹 15)
+- **Depends on**: NF-COST-001 (기본 인프라 비용 한도 정책)
+- **Blocks**: Public Pilot (Stage 2) 오픈 전 장기 운영 안정성 확보
