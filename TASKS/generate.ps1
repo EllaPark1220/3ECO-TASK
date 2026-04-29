@@ -98,10 +98,4 @@ foreach ($t in $tasks) {
 
 $mermaid += "```````n"
 
-$finalMarkdown = "# 경제 판단력 교과서 전체 TASK 의존성 상세 다이어그램`n`n"
-$finalMarkdown += "본 다이어그램은 ``0. TASK_LIST.md``에 정의된 모든 태스크 간의 의존성을 파싱하여 렌더링한 것입니다.`n`n"
-$finalMarkdown += "> 💡 **참고**: 전체 194개의 노드와 연결선이 모두 그려져 있으므로, 렌더링에 다소 시간이 걸리거나 에디터에 따라 넓은 화면이 필요할 수 있습니다.`n`n"
-$finalMarkdown += $mermaid
-
-[IO.File]::WriteAllText("$(Get-Location)\0. TASK_DEPENDENCY_GRAPH.md", $finalMarkdown, [System.Text.Encoding]::UTF8)
-Write-Host "Done!"
+[IO.File]::WriteAllText("$(Get-Location)\0. TASK_DEPENDENCY_GRAPH.md", $mermaid, [System.Text.Encoding]::UTF8)
